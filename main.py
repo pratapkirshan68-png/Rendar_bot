@@ -68,6 +68,10 @@ class MovieBot(Client):
             print(f"❌ MongoDB Error: {e}")
             self.db_error = str(e)
             self.movies = None 
+
+        @app.on_message(filters.chat(SEARCH_CHAT))
+async def DEBUG_TRAP(client, msg):
+    await client.send_message(msg.chat.id, "🧪 DEBUG TRAP HIT")
             
         self.bot_info = await self.get_me()
         print(f"🚀 BOT @{self.bot_info.username} STARTED")
