@@ -241,7 +241,6 @@ def detect_season(query):
     m = re.search(r'(season|s)\s?(\d+)', query.lower())
     return int(m.group(2)) if m else None
 
-
 @app.on_message(
     filters.chat(SEARCH_CHAT)
     & filters.text
@@ -249,14 +248,9 @@ def detect_season(query):
 )
 async def search_movie(client, msg):
 
-    query_raw = msg.text.strip()
-    if len(query_raw) < 2:
-        return
-
-    # 👇 DELETE YAHAN NAHI
     searching = await client.send_message(
         msg.chat.id,
-        f"🔍 Searching: `{query_raw}`"
+        f"🔍 Searching: `{msg.text}`"
     )
 
     # ---- Force Join ----
@@ -266,6 +260,8 @@ async def search_movie(client, msg):
             msg.chat.id,
             "❌ Pehle channel join karo"
         )
+
+    # aage ka search logic yahan aayega
 
     season_no = detect_season(query_raw)
     query = normalize(query_raw)
