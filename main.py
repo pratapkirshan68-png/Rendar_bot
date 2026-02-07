@@ -361,8 +361,15 @@ async def start_handler(client, msg):
         else:
             await msg.reply("❌ File Not Found in Database.")
 
+from pyrogram import idle
+import asyncio
+
+async def main():
+    await start_web_server()   # ✅ web server start
+    await app.start()          # ✅ pyrogram start
+    await idle()               # ✅ bot alive
+    await app.stop()
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(start_web_server())
-    app.run()
+    asyncio.run(main())
 
