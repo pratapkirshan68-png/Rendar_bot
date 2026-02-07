@@ -256,7 +256,6 @@ async def search_movie(client, msg):
 
     if client.movies is None:
         await sm.edit("❌ Database Connected Nahi Hai.")
-        asyncio.create_task(delete_after_delay([sm], 15))
         return
 
     try:
