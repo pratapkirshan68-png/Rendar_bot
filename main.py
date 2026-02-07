@@ -242,11 +242,6 @@ async def search_movie(client, msg):
     if len(query) < 3:
         return
 
-    try:
-        await msg.delete()
-    except:
-        pass
-
     u_name = msg.from_user.first_name if msg.from_user else "User"
     u_id = msg.from_user.id if msg.from_user else "N/A"
 
