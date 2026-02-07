@@ -3,6 +3,7 @@ import re
 import asyncio
 import aiohttp
 import logging
+import time # Cooldown ke liye
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, MessageIdInvalid, FloodWait
@@ -22,7 +23,6 @@ MONGO_URL = get_clean_var("MONGO_URL", "")
 
 ADMIN_IDS = [int(x) for x in get_clean_var("ADMIN_IDS", "0").split()]
 STORAGE_CHANNEL = int(get_clean_var("STORAGE_CHANNEL", "0")) 
-LOG_CHANNEL = int(get_clean_var("LOG_CHANNEL", "0")) 
 SEARCH_CHAT = int(get_clean_var("SEARCH_CHAT", "0")) 
 FSUB_CHANNEL = int(get_clean_var("FSUB_CHANNEL", "0")) 
 MAIN_CHANNEL_LINK = get_clean_var("MAIN_CHANNEL_LINK", "https://t.me/Movies2026Cinema")
@@ -33,6 +33,9 @@ SHORT_API_KEY = get_clean_var("SHORT_API_KEY", "")
 
 SHORTLINK_ENABLED = True 
 
+# Anti-Spam Dictionary
+user_cooldowns = {}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -42,7 +45,6 @@ class MovieBot(Client):
         self.mongo_client = None
         self.db = None
         self.movies = None
-        self.db_error = None 
 
     async def start(self):
         await super().start()
@@ -51,13 +53,12 @@ class MovieBot(Client):
             self.db = self.mongo_client["PratapCinemaBot"]
             self.movies = self.db["movies"]
             await self.db.command("ping")
-            logger.info("✅ MongoDB Connected Successfully!")
+            print("✅ MongoDB Connected!")
         except Exception as e:
-            self.db_error = str(e)
-            logger.error(f"❌ MongoDB Error: {e}")
+            print(f"❌ MongoDB Error: {e}")
             
         self.bot_info = await self.get_me()
-        logger.info(f"🚀 BOT @{self.bot_info.username} STARTED")
+        print(f"🚀 BOT @{self.bot_info.username} STARTED")
 
     async def stop(self, *args):
         await super().stop()
@@ -68,7 +69,7 @@ app = MovieBot()
 
 # ================== WEB SERVER ==================
 async def health_check(request):
-    return web.Response(text="Bot is Running")
+    return web.Response(text="Bot is Alive")
 
 async def start_web_server():
     server = web.Application()
@@ -77,6 +78,180 @@ async def start_web_server():
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     await web.TCPSite(runner, "0.0.0.0", port).start()
+
+# ================= HELPERS =================
+
+async def get_shortlink(url):
+    if not SHORTLINK_ENABLED: return url
+    try:
+        api_url = f"https://{SHORT_DOMAIN}/api?api={SHORT_API_KEY}&url={url}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, timeout=5) as resp:
+                res = await resp.json()
+                if res.get("status") == "success": return res["shortenedUrl"]
+    except: pass
+    return url
+
+def clean_name(text):
+    if not text: return ""
+    text = text.lower()
+    junk = ['1080p', '720p', '480p', 'x264', 'x265', 'hevc', 'hindi', 'english', 'dual audio', 'web-dl', 'bluray']
+    for word in junk: text = text.replace(word, '')
+    text = re.sub(r'\(.*?\)|\[.*?\]', '', text)
+    return " ".join(text.replace(".", " ").replace("_", " ").split()).strip()
+
+async def get_tmdb_info(query):
+    search_q = re.sub(r'\d{4}', '', query).strip()
+    url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={search_q}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get('results'):
+                        res = data['results'][0]
+                        p_path = res.get('poster_path') or res.get('backdrop_path')
+                        poster = f"https://image.tmdb.org/t/p/w342{p_path}" if p_path else None
+                        title = res.get('title') or res.get('name') or query.upper()
+                        return poster, title
+    except: pass
+    return None, query.upper()
+
+async def delete_after_delay(msgs, delay):
+    await asyncio.sleep(delay)
+    for m in msgs:
+        try: await m.delete()
+        except: pass
+
+# ================= ADMIN COMMANDS =================
+
+@app.on_message(filters.command("pratap") & filters.user(ADMIN_IDS))
+async def stats_cmd(client, msg):
+    count = await client.movies.count_documents({})
+    await msg.reply(f"📊 **Total Movies:** `{count}`")
+
+@app.on_message(filters.command("del") & filters.user(ADMIN_IDS))
+async def delete_movie_cmd(client, msg):
+    if len(msg.command) < 2: return
+    query = " ".join(msg.command[1:])
+    result = await client.movies.delete_many({"title": {"$regex": query, "$options": "i"}})
+    await msg.reply(f"🗑️ Deleted `{result.deleted_count}` items.")
+
+# ================= STORAGE =================
+
+@app.on_message(filters.chat(STORAGE_CHANNEL) & (filters.video | filters.document))
+async def add_to_db(client, msg):
+    file = msg.video or msg.document
+    if not file: return
+    title = clean_name(msg.caption or file.file_name or "Unknown")
+    await client.movies.insert_one({"title": title, "file_id": file.file_id})
+    await msg.reply_text(f"✅ Added: `{title}`")
+
+# ================= SEARCH LOGIC (WITH COOLDOWN) =================
+
+@app.on_message(filters.chat(SEARCH_CHAT) & filters.text & ~filters.command(["start", "pratap", "del"]))
+async def search_movie(client, msg):
+    if not msg.from_user: return
+    
+    user_id = msg.from_user.id
+    current_time = time.time()
+    
+    # 20 Second Anti-Spam Check
+    if user_id in user_cooldowns:
+        remaining = int(20 - (current_time - user_cooldowns[user_id]))
+        if remaining > 0:
+            m = await msg.reply(f"⏳ **Anti-Spam:** Please wait `{remaining}s` before next search.")
+            asyncio.create_task(delete_after_delay([m, msg], 5))
+            return
+
+    user_cooldowns[user_id] = current_time
+    original_query = msg.text
+    query = clean_name(original_query)
+    if len(query) < 2: return
+
+    sm = await client.send_message(msg.chat.id, f"🔍 **Searching for:** `{original_query}`...")
+
+    try:
+        # Step 1: Search Database (Limit 20 results for Series/Multiple files)
+        keywords = query.split()
+        regex_pattern = ".*".join(keywords)
+        cursor = client.movies.find({"title": {"$regex": regex_pattern, "$options": "i"}})
+        results = await cursor.to_list(length=20) 
+
+        if not results:
+            await sm.edit(f"❌ `{original_query}` nahi mili!")
+            asyncio.create_task(delete_after_delay([sm, msg], 10))
+            return 
+
+        poster, m_title = await get_tmdb_info(query)
+        
+        buttons = []
+        for item in results:
+            bot_url = f"https://t.me/{client.bot_info.username}?start=file_{str(item['_id'])}"
+            short_link = await get_shortlink(bot_url)
+            buttons.append([InlineKeyboardButton(f"🎬 {item['title'][:45]}", url=short_link)])
+
+        buttons.append([InlineKeyboardButton("✨ JOIN CHANNEL ✨", url=MAIN_CHANNEL_LINK)])
+        
+        cap = (f"🎬 **Movie Name:** `{m_title}`\n\n"
+               f"👤 **User:** {msg.from_user.first_name}\n"
+               f"🆔 **ID:** `{user_id}`")
+
+        if poster:
+            res_msg = await client.send_photo(msg.chat.id, poster, caption=cap, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            res_msg = await client.send_message(msg.chat.id, cap, reply_markup=InlineKeyboardMarkup(buttons))
+        
+        await sm.delete()
+        try: await msg.delete()
+        except: pass
+        asyncio.create_task(delete_after_delay([res_msg], 300))
+        
+    except Exception as e:
+        logger.error(f"Search Error: {e}")
+
+# ================= START / FSUB =================
+
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client, msg):
+    if not msg.from_user: return
+    user_id = msg.from_user.id
+    
+    if FSUB_CHANNEL:
+        try:
+            await client.get_chat_member(FSUB_CHANNEL, user_id)
+        except UserNotParticipant:
+            try:
+                chat = await client.get_chat(FSUB_CHANNEL)
+                invite = chat.invite_link or MAIN_CHANNEL_LINK
+            except: invite = MAIN_CHANNEL_LINK
+            
+            btn = [[InlineKeyboardButton("📢 JOIN CHANNEL 📢", url=invite)]]
+            if len(msg.command) > 1:
+                btn.append([InlineKeyboardButton("🔄 Try Again", url=f"https://t.me/{client.bot_info.username}?start={msg.command[1]}")])
+            return await msg.reply("❌ **Access Denied!**\n\nFile paane ke liye channel join karein.", reply_markup=InlineKeyboardMarkup(btn))
+        except: pass
+
+    if len(msg.command) < 2:
+        return await msg.reply("👋 Namaste! Group mein movie search karein.")
+
+    data = msg.command[1]
+    if data.startswith("file_"):
+        try:
+            m_id = data.split("_")[1]
+            res = await client.movies.find_one({"_id": ObjectId(m_id)})
+            if res:
+                sf = await client.send_cached_media(msg.chat.id, res["file_id"], 
+                                                  caption=f"📂 **File Name:** `{res['title']}`\n\n⚠️ Delete in 2 mins.")
+                asyncio.create_task(delete_after_delay([sf], 120))
+            else:
+                await msg.reply("❌ File Not Found.")
+        except: pass
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web_server())
+    app.run()    await web.TCPSite(runner, "0.0.0.0", port).start()
 
 # ================= HELPERS =================
 
