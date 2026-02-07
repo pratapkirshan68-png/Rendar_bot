@@ -2,58 +2,34 @@ import os
 import re
 import asyncio
 import aiohttp
-import logging
-import time
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import UserNotParticipant, MessageIdInvalid, FloodWait, PeerIdInvalid
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
-from aiohttp import web
 
-# ================= CONFIGURATION =================
-def get_clean_var(key, default=""):
-    val = os.environ.get(key, default)
-    return str(val).strip()
+# ================= CONFIGURATION (Purely from Render) =================
 
-API_ID = int(get_clean_var("API_ID", "0"))
-API_HASH = get_clean_var("API_HASH", "")
-BOT_TOKEN = get_clean_var("BOT_TOKEN", "")
-MONGO_URL = get_clean_var("MONGO_URL", "")
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URL = os.environ.get("MONGO_URL")
 
-ADMIN_IDS = [int(x) for x in get_clean_var("ADMIN_IDS", "0").split()]
-STORAGE_CHANNEL = int(get_clean_var("STORAGE_CHANNEL", "0")) 
-SEARCH_CHAT = int(get_clean_var("SEARCH_CHAT", "0")) 
-FSUB_CHANNEL = int(get_clean_var("FSUB_CHANNEL", "0")) 
-MAIN_CHANNEL_LINK = get_clean_var("MAIN_CHANNEL_LINK", "https://t.me/Movies2026Cinema")
+# Ye IDs ab Render ke "Environment Variables" se uthayi jayengi
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS").split()]
+STORAGE_CHANNEL = int(os.environ.get("STORAGE_CHANNEL"))
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
+SEARCH_CHAT = int(os.environ.get("SEARCH_CHAT"))
+FSUB_CHANNEL = int(os.environ.get("FSUB_CHANNEL"))
 
-TMDB_API_KEY = get_clean_var("TMDB_API_KEY", "")
-SHORT_DOMAIN = get_clean_var("SHORT_DOMAIN", "arolinks.com")
-SHORT_API_KEY = get_clean_var("SHORT_API_KEY", "")
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+SHORT_DOMAIN = os.environ.get("SHORT_DOMAIN")
+SHORT_API_KEY = os.environ.get("SHORT_API_KEY")
+MAIN_CHANNEL_LINK = os.environ.get("MAIN_CHANNEL_LINK")
 
+# Toggle for Shortener
 SHORTLINK_ENABLED = True 
-user_cooldowns = {}
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-class MovieBot(Client):
-    def __init__(self):
-        super().__init__("pratap_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-        self.movies = None
-
-    async def start(self):
-        await super().start()
-        try:
-            db_client = AsyncIOMotorClient(MONGO_URL)
-            self.movies = db_client["PratapCinemaBot"]["movies"]
-            print("✅ MongoDB Connected Successfully!")
-        except Exception as e:
-            print(f"❌ MongoDB Connection Error: {e}")
-        self.bot_info = await self.get_me()
-        print(f"🚀 BOT @{self.bot_info.username} IS ONLINE")
-
-app = MovieBot()
+app = Client("pratap_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ================= HELPERS =================
 
@@ -68,18 +44,96 @@ async def get_shortlink(url):
     except: pass
     return url
 
-def clean_name(text):
-    if not text: return ""
-    text = text.lower()
-    junk = ['1080p', '720p', '480p', 'x264', 'x265', 'hevc', 'hindi', 'english', 'dual audio', 'web-dl', 'bluray']
-    for word in junk: text = text.replace(word, '')
-    text = re.sub(r'\(.*?\)|\[.*?\]', '', text)
-    return " ".join(text.replace(".", " ").replace("_", " ").split()).strip()
+async def auto_delete(msg):
+    await asyncio.sleep(120) # 2 minutes delete timer
+    try: await msg.delete()
+    except: pass
 
-async def delete_after_delay(msgs, delay):
-    await asyncio.sleep(delay)
-    for m in msgs:
-        try: await m.delete()
+# ================= SEARCH LOGIC =================
+
+@app.on_message(filters.chat(SEARCH_CHAT) & filters.text & ~filters.command(["start"]))
+async def search_movie(client, msg):
+    query = msg.text.strip().lower()
+    if len(query) < 2: return
+
+    db_client = AsyncIOMotorClient(MONGO_URL)
+    collection = db_client["PratapCinemaBot"]["movies"]
+    
+    # Keyword search logic
+    keywords = query.split()
+    regex_pattern = ".*".join(keywords)
+    cursor = collection.find({"title": {"$regex": regex_pattern, "$options": "i"}})
+    results = await cursor.to_list(length=20)
+
+    if not results: return
+
+    buttons = []
+    me = await client.get_me()
+    for item in results:
+        bot_url = f"https://t.me/{me.username}?start=file_{str(item['_id'])}"
+        short_link = await get_shortlink(bot_url)
+        buttons.append([InlineKeyboardButton(f"🎬 {item['title']}", url=short_link)])
+
+    buttons.append([InlineKeyboardButton("✨ JOIN CHANNEL ✨", url=MAIN_CHANNEL_LINK)])
+    
+    await msg.reply(
+        f"🔍 **Results for:** `{msg.text}`\n👤 **User:** {msg.from_user.first_name if msg.from_user else 'Admin'}",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ================= START / FSUB / FILE DELIVERY =================
+
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client, msg):
+    user_id = msg.from_user.id
+    
+    if len(msg.command) > 1 and msg.command[1].startswith("file_"):
+        # Force Join Check
+        try:
+            await client.get_chat_member(FSUB_CHANNEL, user_id)
+        except:
+            btn = [[InlineKeyboardButton("📢 JOIN CHANNEL 📢", url=MAIN_CHANNEL_LINK)]]
+            return await msg.reply("❌ **Pehle channel join karein tabhi file milegi!**", reply_markup=InlineKeyboardMarkup(btn))
+
+        # File Delivery
+        m_id = msg.command[1].split("_")[1]
+        db_client = AsyncIOMotorClient(MONGO_URL)
+        res = await db_client["PratapCinemaBot"]["movies"].find_one({"_id": ObjectId(m_id)})
+        
+        if res:
+            cap = f"📂 **File:** `{res['title']}`\n\n⚠️ Yeh file 2 minute mein delete ho jayegi!"
+            sent_file = await client.send_cached_media(msg.chat.id, res["file_id"], caption=cap)
+            
+            # Log to Backup Channel
+            await client.send_cached_media(LOG_CHANNEL, res["file_id"], caption=f"👤 User: {user_id}\n📂 File: {res['title']}")
+            
+            # Auto Delete
+            asyncio.create_task(auto_delete(sent_file))
+        else:
+            await msg.reply("❌ File not found in Database.")
+    else:
+        await msg.reply("👋 Hello! Movie search karne ke liye hamare group ka use karein.")
+
+# ================= STORAGE (Adding files to DB) =================
+
+@app.on_message(filters.chat(STORAGE_CHANNEL) & (filters.video | filters.document))
+async def add_to_db(client, msg):
+    file = msg.video or msg.document
+    title = (msg.caption or file.file_name or "Unknown").lower()
+    db_client = AsyncIOMotorClient(MONGO_URL)
+    await db_client["PratapCinemaBot"]["movies"].insert_one({"title": title, "file_id": file.file_id})
+    await msg.reply_text(f"✅ Added to DB: `{title}`")
+
+# ================= ADMIN COMMANDS =================
+
+@app.on_message(filters.command("pratap") & filters.user(ADMIN_IDS))
+async def stats(client, msg):
+    db_client = AsyncIOMotorClient(MONGO_URL)
+    count = await db_client["PratapCinemaBot"]["movies"].count_documents({})
+    await msg.reply(f"📊 **Total Movies in DB:** `{count}`")
+
+if __name__ == "__main__":
+    app.run()        try: await m.delete()
         except: pass
 
 # ================= SEARCH LOGIC =================
