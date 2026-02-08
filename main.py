@@ -291,6 +291,8 @@ async def search_movie(client, msg):
         res_msg = await client.send_message(msg.chat.id, cap, reply_markup=InlineKeyboardMarkup(btn_list))
     
     await sm.delete()
+    asyncio.create_task(delete_after_delay([res_msg], 600))
+
 
 # ================= START / FSUB =================
 
